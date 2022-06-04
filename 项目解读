@@ -1,0 +1,674 @@
+数据库设计：
+    用户表：
+        ID   用户名   密码   邮箱   是否激活  权限标识
+    
+    地址表：
+        ID   收件人   地址  邮编   联系方式  用户ID  是否默认
+    
+    商品SKU表：
+        ID   名称   简介   价格    单位   库存  销量   状态   种类ID   图片  SPU ID
+
+    商品种类表：
+        ID    sku ID   种类名称   logo
+
+    商品图片表：
+        ID    sku ID   图片路径     
+
+    商品SPU表：
+        ID    名称    详情      
+
+    首页轮播商品表：
+        ID    sku ID   图片    index    
+
+    首页促销活动表：
+        ID    图片   跳转url   index
+    
+    首页分类商品展示表：
+        ID    sku ID   种类ID   index   展示标识
+
+    redis实现购物车功能
+
+    redis保存用户历史浏览记录
+
+    订单信息表：
+        订单ID    地址ID   用户ID  支付方式  总数目  商品  总金额   运费   支付状态   创建时间    
+    
+    订单商品表:
+        ID  sku ID  订单ID   商品数量   商品价格   评论
+
+
+模型类：
+    1. choices属性  自定义choices列表STATUS_CHOICES  choices=STATUS_CHOICES
+    
+    2. HTMLField 富文本编辑字段    from tinymce.model import HTMLField
+        tinymce  注册到app中并配置
+            TINYMCE_DEFAULT_CONFIG = {
+                'theme': 'advanced',
+                'width': 600,
+                'height': 400,
+            }
+    3. Meta内属性verbose_name = ''  verbose_name_plural = verbose_name  展示名称
+    
+    4. user模型类 继承django内置的user模块认证  from django.contrib.auth.models import AbstractUser
+        配置文件：
+            # django认证系统使用的模型类(替换默认的auth_user)
+            AUTH_USER_MODEL = 'user.User'       
+
+    5. 定义了basemodel类 所有模型继承  实现时间和删除记录的字段
+        from django.db import models
+
+        class BaseModel(models.Model):
+            """模型抽象基类"""
+            create_time = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+            update_time = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+            is_delete = models.BooleanField(default=False, verbose_name='删除标记')
+
+            class Meta:
+                # 说明是一个抽象模型类
+                abstract = True
+
+用户模块:
+    register:
+        使用内置的方法：
+            # 创建user最直接的方法create_user()辅助函数
+            user = models.User.objects.create_user(username, email, pwd)
+            user.is_active = 0
+            user.save()
+        
+        加密数据  itsdangerous 对激活操作的用户id进行加密  可以设置过期时间
+            from itsdangerous import TimedJSONWebSignatureSerializer as Serializer
+            
+            # 加密用户的身份信息，生成激活token
+                serializer = Serializer(settings.SECRET_KEY, 3600)
+                info = {'confirm': user.id}
+                token = serializer.dumps(info)  # byte
+                token = token.decode()
+
+        激活视图：
+            from itsdangerous import SignatureExpired
+
+            serializer = Serializer(settings.SECRET_KEY, 3600)
+            try:
+                info = serializer.loads(token)
+                user_id = info['confirm']
+
+                # 根据id获取用户信息
+                user = User.objects.get(id=user_id)
+                user.is_active = 1
+                user.save()
+
+                # 跳转到登录页面
+                return redirect(reverse('login'))
+            except SignatureExpired as e:
+                """激活链接已过期"""
+                return HttpResponse('激活链接已过期')
+
+        发送邮件：
+            使用django默认的函数 from django.core.mail import send_mail
+            采用celery进行异步发送
+            tasks.py 文件：
+
+                app = Celery('celery_tasks.tasks', broker='redis://127.0.0.1:6379/1')  # 使用1号数据库
+
+                @app.task
+                def send_register_active_email(to_email, username, token):
+                    """发送激活邮件"""
+                    # 组织邮件信息
+                    subject = '天天生鲜欢迎信息'
+                    message = ''
+                    sender = settings.EMAIL_FROM
+                    receiver = [to_email]  # 收件人邮箱列表
+                    html_message = '<h1>%s,欢迎您成为天天生鲜注册会员</h1>请点击以下链接进行激活:<br>' % username
+                    html_message += '<a href="http://127.0.0.1:8000/user/active/%s">http://127.0.0.1:8000/user/active/%s</a>' % (token, token)
+                    send_mail(subject, message, sender, receiver, html_message=html_message)
+                    time.sleep(5)
+
+            视图中： send_register_active_email.delay(email, username, token)
+
+            任务处理者： 在当前目录下
+                celery -A celery_tasks.tasks -l info
+                tasks.py 中需要添加初始化
+                    # django环境的初始化
+                    import os
+                    import django
+
+                    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'dailyfresh.settings')
+                    django.setup()
+
+
+    login:
+        采用django内置的方法：
+            from django.contrib.auth import authenticate, login
+
+            # 业务处理  登录校验
+            user = authenticate(username=username, password=password)
+        
+            # 记录用户登录状态
+            login(request, user)
+        
+        
+        cookie记录username（判断是否记住用户名）
+            response = redirect(reverse('index'))
+            response.set_cookie('username', username, max_age=7*24*3600)
+            response.delete_cookie('username')
+
+            username = request.COOKIES.get('username')
+
+
+        session配置redis存储  和redis做缓存：
+
+            CACHES = {
+                "default": {
+                    "BACKEND": "django_redis.cache.RedisCache",
+                    "LOCATION": "redis://127.0.0.1:6379/9",
+                    "OPTIONS": {
+                        "CLIENT_CLASS": "django_redis.client.DefaultClient",
+                    }
+                }
+            }
+
+            # 配置session存储
+            SESSION_ENGINE = "django.contrib.sessions.backends.cache"
+            SESSION_CACHE_ALIAS = "default"
+    
+
+    center:
+        根据返回值page: info/order/address 在前端显示字体红色
+
+        登录装饰器:
+            utils/mixin.py文件中：
+                from django.contrib.auth.decorators import login_required
+                class LoginRequiredMixin:
+                    @classmethod
+                    def as_view(cls, **initkwargs):
+                        # 调用父类的as_view
+                        view = super(LoginRequiredMixin, cls).as_view(**initkwargs)
+                        return login_required(view)
+            view视图类继承LoginRequiredMixin类
+
+
+            # 配置登录url地址
+            LOGIN_URL = '/user/login'
+            未登录跳转url地址： /user/login?next='/user/'  next为之前要访问的url
+
+            在login视图中：
+                next_url = request.GET.get('next', reverse('index'))
+                # 跳转到首页
+                response = redirect(next_url)
+        
+        登录后显示欢迎信息：
+            {% if user.is_authenticated %}
+			<div class="login_btn fl">
+				欢迎您：<em>{{ user.username }}</em>
+            
+            # request.user.is_authenticated()
+            # 除了你给模板文件传递的模板变量之外，django框架会自动把request.user也传给模板文件
+        
+        退出：
+            from django.contrib.auth import logout
+            # 清除用户的session信息
+            logout(request)
+       
+       地址页：
+            get查看  判断是否有默认地址 前端判断显示
+            post提交    判断是否需要设为默认地址
+        
+            自定义模型管理器对象：
+                Address模型类：
+                    objects = AddressManager()
+
+                model类：
+                    class AddressManager(models.Manager):
+                        def get_default_address(self, user):
+                            """获取用户的默认收获地址"""
+                            try:
+                                address = self.get(user=user, is_default=True)
+                            except self.model.DoesNotExist:
+                                # 不存在默认收获地址
+                                address = None
+                            return address
+
+        
+        用户中心页：
+            redis存储历史浏览记录
+                使用list保存 每个用户一条数据  用户最新浏览的记录从左侧插入
+                history_用户id:[2,3,1]
+
+            from django_redis import get_redis_connection
+            
+            con = get_redis_connection()
+            history_key = 'history_%d' % user.id
+            # 获取用户最新浏览的五个商品的id
+            sku_ids = con.lrange(history_key, 0, 4)
+        
+
+        
+    fastdfs存储图片
+        解决海量存储，存储容量扩展方便，解决文件内容重复冗余，结合nginx提高网站提供图片的效率
+       流程：
+            1. 浏览器通过admin页面上传图片  请求到django服务器 后端修改上传行为，
+               把文件上传到fastdfs中
+            2. fdfs文件存储服务器存储后返回文件id /group1/... 到django，django服务器
+               将id保存在对应表image中
+            3. 当浏览器访问网址需要图片时发送请求，django渲染页面<img src="http://172.16.179.131:8888/文件id">
+            4. 显示页面时，src对应的url会请求nginx获取图片，nginx拿到fdfs内的图片返回图片内容给浏览器
+        
+        不使用django默认的文件存储类 Storage  而是自定义文件存储类
+        继承Storage类  重写_save，_open和exists方法
+
+        from django.core.files.storage import Storage
+        from fdfs_client.client import Fdfs_client
+
+        class FDFSStorage(Storage):
+            """fast DFS 文件存储类"""
+            def __init__(self, client_conf=None, base_url=None):
+                """初始化"""
+                if client_conf is None:
+                    client_conf = settings.FDFS_CLIENT_CONF
+                self.client_conf = client_conf
+
+                if base_url is None:
+                    base_url = settings.FDFS_URL
+                self.base_url = base_url
+
+            def _open(self, name, mode='rb'):
+                """打开文件时使用"""
+                pass
+
+            def _save(self, name, content):
+                """保存文件时使用"""
+                # name： 你选择上传的文件名字
+                # content：包含你上传文件内容的file对象
+
+                # 创建一个fdfs_client对象
+                client = Fdfs_client(self.client_conf)
+
+                # 上传文件到fdfs服务器
+                res = client.upload_by_buffer(content.read())
+                # dict {
+                #     'Group name': group_name,
+                #     'Remote file_id': remote_file_id,
+                #     'Status': 'Upload successed.',
+                #     'Local file name': '',
+                #     'Uploaded size': upload_size,
+                #     'Storage IP': storage_ip
+                # }
+                if res.get('status') != 'Upload successed.':
+                    # 上传失败
+                    raise Exception('上传文件失败')
+
+                # 获取返回的文件id
+                file_name = res.get('Remote file_id')
+
+                return file_name
+
+            def exists(self, name):
+                """django判断文件名是否可用"""
+                # 由于不使用默认django存储  false表示可用  true表示不可用 直接返回false
+                return False
+
+            def url(self, name):
+                """返回访问文件url路径"""
+                # 前端使用{{ goods.image.url }}就会触发这个方法
+                return self.base_url + name
+
+首页：
+    首页页面的静态化  celery  
+    当管理员修改了首页信息对应的表格中的数据，需要重新生成首页静态页
+    tasks.py文件:
+        from django.template import loader
+
+        查询所需数据后渲染模板
+        # 1.加载模板文件,返回模板对象
+        temp = loader.get_template('static_index.html')
+        # 2. 模板渲染
+        static_index_html = temp.render(locals())
+
+        # 生成首页对应静态文件  写到celery worker对应的服务器中
+        save_path = os.path.join(settings.BASE_DIR, 'static/index.html')
+        with open(save_path, 'w') as f:
+            f.write(static_index_html)
+    
+    
+    采用nginx返回首页静态文件
+        配置nginx配置文件  server  location
+    
+
+    重写goods admin.py的admin属性
+    实现save_model和delete_model方法 当后台修改数据时会调用
+
+    定义base类  所有的admin类继承base类
+    class BaseModelAdmin(admin.ModelAdmin):
+        def save_model(self, request, obj, form, change):
+            """新增或更新表中的数据时调用"""
+            super().save_model(request, obj, form, change)
+
+            # 发出任务，让celery worker重新生成首页静态页
+            from celery_tasks.tasks import generate_static_index_html
+            generate_static_index_html.delay()
+
+            # 清除首页的缓存存储
+            cache.delete('index_page_data')
+
+        def delete_model(self, request, obj):
+            """删除表中的数据时调用"""
+            super().delete_model(request, obj)
+            # 发出任务，让celery worker重新生成首页静态页
+            from celery_tasks.tasks import generate_static_index_html
+            generate_static_index_html.delay()
+
+            # 清除首页的缓存存储
+            cache.delete('index_page_data')
+
+    首页缓存设置：  减少数据查询的次数  防止恶意攻击
+        from django.core.cache import cache
+        cache.set('index_page_data', context, 3600)
+        cache.get('index_page_data)
+    
+    首页缓存更新:  同celery中修改  删除缓存
+        cache.delete('index_page_data)
+
+
+    views中：
+        # 动态给type增加属性，分别保存首页分类商品的图片信息和文字信息
+            type.image_banners = image_banners
+            type.title_banners = title_banners
+    
+    
+    购物车存储：
+        hash来存储 cart_用户id: {'sku_id1': 数量, 'sku_id2': 数量}  hlen
+
+        if user.is_authenticated():
+            conn = get_redis_connection()
+            cart_key = 'cart_%d' % user.id
+            cart_count = conn.hlen(cart_key)
+    
+
+详情页面：
+    确认登录后，不仅需要查询购物车的数量，还要更新用户历史浏览记录
+        if user.is_authenticated:
+            # 用户已登录
+            conn = get_redis_connection()
+            cart_key = 'cart_%d' % user.id
+            cart_count = conn.hlen(cart_key)
+
+            # 添加用户的历史记录
+            conn = get_redis_connection()
+            history_key = 'history_%d' % user.id
+            # 移除列表中的goods_id
+            conn.lrem(history_key, 0, goods_id)
+            # 左侧插入
+            conn.lpush(history_key, goods_id)
+            # 只保存五条
+            conn.ltrim(history_key, 0, 4)
+    
+
+列表页：
+
+    # /list/种类id/页码?sort=排序方式 
+    
+    根据sort不同 排序查询 
+
+    分页：
+        paginator = Paginator(skus, 1)
+
+            # 获取第page页的内容
+            try:
+                page = int(page)
+            except Exception as e:
+                page = 1
+            if page > paginator.num_pages:
+                page = 1
+            # 获取第page页的对象
+            skus_page = paginator.page(page)
+
+            # 进行页码控制，页面上最多显示5个页码
+            # 1. 总数小于5页  显示所有页码
+            # 2. 如果当前页是前三页，显示1-5页
+            # 3. 如果当前页是后三页，显示后五页
+            # 4. 显示当前页的前两页，和后两页
+            num_pages = paginator.num_pages
+            if num_pages < 5:
+                pages = range(1, num_pages+1)
+            elif page <= 3:
+                pages = range(1, 6)
+            elif num_pages - page <= 2:
+                pages = range(num_pages-4, num_pages+1)
+            else:
+                pages = range(page-2, page+3)
+
+
+商品搜索：
+    haystack全文检索框架  whoosh搜索引擎   django-haystack
+
+    1. 在goods目录下 创建 search_indexes.py文件
+
+    # 定义索引类
+    from haystack import indexes
+    # 导入你的模型类
+    from goods.models import GoodsSKU
+
+
+    # 指定对于某个类的某些数据建立索引
+    # 索引类名格式：模型类名+index
+    class GoodsSKUIndex(indexes.SearchIndex, indexes.Indexable):
+        # 索引字段  use_template=True指定根据表中的那些数据建立索引文件的说明放在一个文件中
+        text = indexes.CharField(document=True, use_template=True)
+
+        def get_model(self):
+            # 返回你的模型类
+            return GoodsSKU
+
+        # 建立索引的数据
+        def index_queryset(self, using=None):
+            return self.get_model().objects.all()
+
+    2. 在templates目录下创建search/indexes/goods/goodssku_text.txt（商品类的类名小写）
+
+        # 指定根据表中的那些字段建立索引数据
+        {{ object.name }}    # 根据商品的名称建立索引
+        {{ object.desc }}    # 根据商品的简介建立索引
+        {{ object.goods.detail }}    # 根据商品的简介建立索引
+    
+    进入项目目录  python manage.py rebuild_index
+
+    3. 前端搜索框   name必须为q   方法必须为get   action和url对应
+    <form method="get" action="/search">
+		<input type="text" class="input_text fl" name="q" placeholder="搜索商品">
+		<input type="submit" class="input_btn fr" name="" value="搜索">
+	</form>
+
+    4. url：
+        path('search/', include('haystack.urls')),  # 全文检索框架
+    
+    5. haystack搜索结果会传到templates/search.html中 
+       搜索的关键字  {{ query }}
+       当前页的page对象  {{ page }}
+       模型类的对象  item.object  == sku
+            {% for item in page %}
+                <li>{{ item.object }}</li>
+            {% endfor %}
+       分页paginator对象:{{ paginator }}
+
+
+购物车记录添加：
+    前端js实现计算商品总价  增加减少商品的数量  手动输入商品数量
+    点击添加购物车ajax方式发送请求
+
+    校验是否登录   参数完整性 参数问题  数量是否大于库存
+    尝试获取count 如果获取count增加  没有则创建  然后设置   返回商品的数目
+
+        conn = get_redis_connection()
+        cart_key = 'cart_%d' % user.id
+        cart_count = conn.hget(cart_key, sku_id)
+        if cart_count:
+            # 累加购物车中商品的数目
+            count += int(cart_count)
+
+        # 校验商品的库存
+        if count > sku.stock:
+            return JsonResponse({'res': 4, 'errmsg': '商品库存不足'})
+
+        # 设置hash中sku_id对应的值
+        # hset -> 如果sku_id已存在，更新数据;如果sku_id不存在，添加数据
+        conn.hset(cart_key, sku_id, count)
+
+        # 计算用户购物车中商品的条目数
+        total_count = conn.hlen(cart_key)
+
+
+    购物车页面显示：
+        校验是否登录  redis中拿出数据    cart_dict = conn.hgetall(cart_key)
+
+    购物车记录更新和删除
+        conn = get_redis_connection()
+        cart_key = 'cart_%d' % user.id
+
+        # 校验商品的库存
+        if count > sku.stock:
+            return JsonResponse({'res': 4, 'errmsg': "商品库存不足"})
+        # 更新
+        conn.hset(cart_key, sku_id, count)
+
+
+        # 删除
+        conn.hdel(cart_key, sku_id)
+
+        # 计算用户购物车中商品总件数 {'1': 5, '2': 3}   5+3
+        total_count = 0
+        vals = conn.hvals(cart_key)
+        for val in vals:
+            total_count += int(val)
+    
+
+订单生成：
+    from django.db import transaction
+    在函数前加装饰器 @transaction.atomic
+
+    在业务处理前
+        # 设置事务保存点
+        save_id = transaction.savepoint()
+    之后每次出现问题
+        transaction.savepoint_rollback(save_id)
+    最后
+        transact.savepoint_commit(save_id)
+    
+    多个用户形成订单并发问题 加锁  事务结束释放锁 悲观锁
+    # select * from df_goods_sku where id=sku_id for update;
+    sku = GoodsSKU.objects.select_for_update().get(id=sku_id)
+
+    乐观锁  查询数据不加锁  但是在更新时进行判断  业务处理三次 超过三次失败  将事务隔离级别变为读已提交
+        判断更新时的库存和之前查出的库存是否一致
+        不一致 直接回滚
+        # 返回受影响的行数(1行),放在向df_order_goods表中添加记录之前，防止重复加数据
+        res = GoodsSKU.objects.filter(id=sku_id, stock=origin_stock).update(stock=new_stock,
+                                                                                sales=new_sales)
+
+
+订单支付：
+    引导支付：
+    order_string = alipay.api_alipay_trade_page_pay(
+            out_trade_no=order_id,  # 订单id
+            total_amount=str(total_pay),  # 支付总金额
+            subject='天天生鲜%s' % order_id,
+            return_url=None,  # 同步
+            notify_url=None  # 可选,异步， 不填则使用默认notify url
+        )
+    # 返回应答
+        pay_url = 'https://openapi.alipaydev.com/gateway.do?' + order_string
+        return JsonResponse({'res': 3, 'pay_url': pay_url})
+    
+    查看支付状态：
+        response = alipay.api_alipay_trade_query(order_id)
+
+        code = response.get('code')
+            trade_status = response.get('trade_status')
+            if code == '10000' and trade_status == "TRADE_SUCCESS":
+                # 支付成功
+                # 获取支付宝交易号
+                trade_no = response.get('trade_no')
+                # 更新订单状态
+                order.trade_no = trade_no
+                order.order_status = 4  # 待评价
+                order.save()
+                # 返回结果
+                return JsonResponse({'res': 3, 'message': '支付成功'})
+
+            elif code == '40004' or (code == '10000' and trade_status == "WAIT_BUYER_PAY"):
+                # 等待买家付款
+                # 业务处理失败，可能一会儿就会成功(40004)
+                import time
+                time.sleep(5)
+                continue
+
+            else:
+                # 支付出错
+                print(code)
+                return JsonResponse({'res': 4, 'errmsg': '支付失败'})
+
+
+项目部署：
+    settings配置：
+        DEBUG = False
+        ALLOWED_HOSTS = ['*']
+
+
+    uwsgi 创建uwsgi.ini文件：
+    [uwsgi]
+        #使用nginx连接时使用
+        socket=127.0.0.1:8080
+        #直接做web服务器使用 -- 想当于 python manage,py runserver ip地址:port端口号
+        #http=127.0.0.1:8080
+        #项目当前目录
+        chdir=/home/jingping/PycharmProjects/dailyfresh
+        #项目中wsgi.py文件的目录，相对于项目目录
+        wsgi-file=dailyfresh/wsgi.py
+        #指定启动的工作进程数
+        processes=4
+        #指定工作进程中的线程数
+        threads=2
+        master=True
+        #保存启动之后主进程的pid
+        pidfile=uwsgi.pid
+        #设置uwsgi后台运行，uwsgi.log保存日志信息
+        daemonize=uwsgi.log
+        #设置虚拟环境的目录
+        virtualenv=/home/jingping/dailyfresh
+
+    uwsgi启动
+        uwsgi --ini 配置文件路径  uwsgi --ini  uwsgi.ini
+    uwsgi停止
+        uwsgi --stop uwsgi.pid路径
+    
+
+nginx:
+    如果是动态请求，转交给uwsgi
+        配置：
+            location / {
+                include uwsgi_params;
+                uwsgi_pass 127.0.0.1:8080;
+            }
+    如果是静态请求，直接返回静态文件
+        配置：
+            location /static {
+                # 指定静态文件存放的目录
+                alias /var/www/dailyfresh/static/;
+            }
+
+    nginx配置处理静态文件
+        settings配置 STATIC_ROOT='/var/www/dailyfresh/static/'
+        python manage.py collectstatic
+
+    nginx转交请求到其他地址
+        location = / {
+            # 传递请求给静态文件服务器的nginx
+            proxy_pass http://172.16.179.131:80;
+        }
+    
+    nginx实现负载均衡
+        在server配置的前面增加upstream配置项
+        upstream dailyfresh {
+            server 127.0.0.1:8080;
+            server 127.0.0.1:8081;
+        }
+
